@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PRO-CHISTKA</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+body{font-family:Arial,sans-serif;margin:0;background:#f4f4f4;color:#111}.wrap{max-width:520px;margin:auto;padding:18px}.card{background:#fff;border-radius:16px;padding:18px}.btn{display:block;padding:14px;margin:10px 0;border-radius:12px;background:#111;color:#fff;text-decoration:none;text-align:center}.muted{color:#666;font-size:14px;line-height:1.4}
+</style>
+</head>
+<body><div class="wrap"><div class="card"><h2>PRO-CHISTKA</h2><div id="app"></div></div></div>
+<script>
+const tg=window.Telegram?.WebApp;if(tg){tg.ready();tg.expand()}
+const p=new URLSearchParams(location.search),addr=p.get('address')||'';
+const q=encodeURIComponent(addr),box=document.getElementById('app');
+if(addr){box.innerHTML=`<p><b>Маршрут</b></p><p class="muted">${addr}</p>`+
+`<a class="btn" href="https://yandex.ru/maps/?text=${q}">Яндекс Карты</a>`+
+`<a class="btn" href="https://2gis.ru/search/${q}">2ГИС</a>`+
+`<a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${q}">Google Maps</a>`}
+else{box.innerHTML='<p class="muted">Панель Mini App будет подключаться поэтапно. Сейчас страница используется для навигации.</p>'}
+</script></body></html>

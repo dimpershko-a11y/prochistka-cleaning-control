@@ -5,3 +5,5 @@ __pycache__/
 data/*.db
 data/*.db-*
 backups/
+screen*.png
+botfather_message.txt
