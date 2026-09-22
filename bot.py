@@ -3,6 +3,7 @@ import html
 import math
 import os
 import sqlite3
+import socket
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -26,6 +27,20 @@ AFTER_MIN = int(os.getenv('AFTER_MIN_PHOTOS', '4'))
 GEOFENCE_OK = int(os.getenv('GEOFENCE_OK_M', '150'))
 GEOFENCE_WARN = int(os.getenv('GEOFENCE_WARN_M', '300'))
 router = Router()
+_instance_socket = None
+
+
+def acquire_instance_lock():
+    global _instance_socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', 47631))
+        sock.listen(1)
+    except OSError:
+        sock.close()
+        return False
+    _instance_socket = sock
+    return True
 def now_iso():
     return datetime.now().astimezone().isoformat(timespec='seconds')
 
@@ -288,6 +303,29 @@ async def cb_arrive(call: CallbackQuery):
     set_session(call.from_user.id, oid, 'ARRIVAL_LOCATION', None)
     await call.answer()
     await call.message.answer('Отправьте текущую геолокацию.', reply_markup=location_keyboard())
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Подтвердить без геолокации', callback_data=f'arrive_manual:{oid}')]])
+    await call.message.answer('Если геолокация недоступна:', reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith('arrive_manual:'))
+async def arrive_manual(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return
+    oid = int(call.data.split(':')[1])
+    order = get_order(oid)
+    if not order or order['status'] != 'PLANNED':
+        await call.answer('Этап уже пройден.', show_alert=True)
+        return
+    with db() as c:
+        c.execute('UPDATE orders SET arrived_at=? WHERE id=?', (now_iso(), oid))
+    set_status(oid, 'ARRIVED', 'manual_arrival')
+    set_session(call.from_user.id, oid, None, None)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='Да, согласие подписано', callback_data=f'consent_yes:{oid}')],
+        [InlineKeyboardButton(text='Нет, съёмка запрещена', callback_data=f'consent_no:{oid}')],
+    ])
+    await call.answer('Прибытие подтверждено.')
+    await call.message.answer('Прибытие зафиксировано без геолокации. Клиент разрешил фото/видео съёмку?', reply_markup=kb)
 
 
 @router.message(F.location)
@@ -484,6 +522,8 @@ async def text_input(message: Message):
 
 
 async def main():
+    if not acquire_instance_lock():
+        raise RuntimeError('BOT_ALREADY_RUNNING')
     if not BOT_TOKEN:
         raise RuntimeError('BOT_TOKEN не заполнен в .env')
     init_db()
