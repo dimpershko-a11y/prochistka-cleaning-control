@@ -28,6 +28,7 @@ GEOFENCE_OK = int(os.getenv('GEOFENCE_OK_M', '150'))
 GEOFENCE_WARN = int(os.getenv('GEOFENCE_WARN_M', '300'))
 router = Router()
 _instance_socket = None
+_media_feedback_tasks = {}
 
 
 def acquire_instance_lock():
@@ -166,7 +167,7 @@ def haversine_m(lat1, lon1, lat2, lon2):
 def main_keyboard():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text='📅 Сегодня')],
-        [KeyboardButton(text='➕ Тестовый заказ')]
+        [KeyboardButton(text='➕ Добавить объект')]
     ], resize_keyboard=True)
 
 
@@ -189,17 +190,29 @@ def order_keyboard(order):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+STATUS_LABELS = {'PLANNED': 'Запланирован', 'ARRIVED': 'Прибыл', 'BEFORE_REQUIRED': 'Нужны фото ДО', 'READY_TO_START': 'Готов к началу', 'IN_PROGRESS': 'Уборка идёт', 'AFTER_REQUIRED': 'Нужны фото ПОСЛЕ', 'READY_TO_COMPLETE': 'Готов к завершению', 'COMPLETED': 'Завершён', 'CANCELLED': 'Отменён'}
+CONSENT_LABELS = {'UNKNOWN': 'Не указано', 'ALLOWED': 'Разрешено', 'DENIED': 'Запрещено'}
+STAGE_LABELS = {'BEFORE': 'ДО', 'AFTER': 'ПОСЛЕ', 'WORK': 'ПРОЦЕСС', 'PROBLEM': 'ПРОБЛЕМА'}
+
+def fmt_time(value):
+    if not value:
+        return '—'
+    try:
+        return datetime.fromisoformat(value).strftime('%H:%M')
+    except Exception:
+        return value
+
 def order_text(order):
     return (
         f"<b>Заказ {html.escape(order['public_number'])}</b>\n"
         f"📍 {html.escape(order['address'])}\n"
-        f"Статус: <b>{order['status']}</b>\n"
-        f"Согласие: <b>{order['consent']}</b>\n\n"
+        f"Статус: <b>{STATUS_LABELS.get(order['status'], order['status'])}</b>\n"
+        f"Согласие: <b>{CONSENT_LABELS.get(order['consent'], order['consent'])}</b>\n\n"
         f"Фото ДО: {count_photos(order['id'], 'BEFORE')}/{BEFORE_MIN}\n"
         f"Фото ПОСЛЕ: {count_photos(order['id'], 'AFTER')}/{AFTER_MIN}\n"
-        f"Прибытие: {order['arrived_at'] or '—'}\n"
-        f"Начало: {order['started_at'] or '—'}\n"
-        f"Окончание: {order['finished_at'] or '—'}"
+        f"Прибытие: {fmt_time(order['arrived_at'])}\n"
+        f"Начало: {fmt_time(order['started_at'])}\n"
+        f"Окончание: {fmt_time(order['finished_at'])}"
     )
 
 
@@ -211,7 +224,7 @@ async def archive_media(bot, message, order, stage, media_type, file_id, unique_
     channel = archive_id()
     archive_message_id = None
     if channel:
-        caption = f"#{order['public_number']} | {stage} | {order['address']}"
+        caption = f"#{order['public_number']} | {STAGE_LABELS.get(stage, stage)} | {order['address']}"
         try:
             if media_type == 'PHOTO':
                 sent = await bot.send_photo(channel, file_id, caption=caption)
@@ -246,7 +259,7 @@ async def start(message: Message):
         return
     get_session(current)
     await message.answer('PRO-CHISTKA Control Bot', reply_markup=main_keyboard())
-@router.message(F.text == '➕ Тестовый заказ')
+@router.message(F.text == '➕ Добавить объект')
 async def new_order(message: Message):
     if not is_owner(message.from_user.id):
         return
@@ -403,12 +416,34 @@ async def consent_no(call: CallbackQuery):
     set_session(call.from_user.id, oid, None, None)
     await call.answer()
     await call.message.answer('Съёмка запрещена. Фото не требуются.', reply_markup=order_keyboard(get_order(oid)))
+async def delayed_photo_feedback(message, user_id, oid, stage):
+    try:
+        await asyncio.sleep(2.5)
+    except asyncio.CancelledError:
+        return
+    order = get_order(oid)
+    count = count_photos(oid, stage)
+    need = BEFORE_MIN if stage == 'BEFORE' else AFTER_MIN
+    label = STAGE_LABELS.get(stage, stage)
+    if count >= need and order:
+        if stage == 'BEFORE' and order['status'] == 'BEFORE_REQUIRED':
+            set_status(oid, 'READY_TO_START', 'before_complete')
+            set_session(user_id, oid, None, None)
+            await message.answer(f'Фото {label}: {count}/{need} ✅', reply_markup=order_keyboard(get_order(oid)))
+        elif stage == 'AFTER' and order['status'] == 'AFTER_REQUIRED':
+            set_status(oid, 'READY_TO_COMPLETE', 'after_complete')
+            set_session(user_id, oid, None, None)
+            await message.answer(f'Фото {label}: {count}/{need} ✅', reply_markup=order_keyboard(get_order(oid)))
+    else:
+        await message.answer(f'Фото {label}: {count}/{need}')
+    _media_feedback_tasks.pop((user_id, oid, stage), None)
+
 @router.message(F.photo | F.video)
 async def media(message: Message, bot: Bot):
     if not is_owner(message.from_user.id):
         return
-    s = get_session(message.from_user.id)
-    oid, stage = s['active_order_id'], s['expected_media_stage']
+    ss = get_session(message.from_user.id)
+    oid, stage = ss['active_order_id'], ss['expected_media_stage']
     if not oid or stage not in ('BEFORE', 'AFTER'):
         await message.answer('Сейчас бот не ожидает фото/видео.')
         return
@@ -423,22 +458,18 @@ async def media(message: Message, bot: Bot):
         item = message.video
         mtype, fid, uid = 'VIDEO', item.file_id, item.file_unique_id
     await archive_media(bot, message, order, stage, mtype, fid, uid)
+    label = STAGE_LABELS.get(stage, stage)
     if mtype == 'VIDEO':
-        await message.answer(f'Видео {stage} сохранено ✅')
+        await message.answer(f'Видео {label} сохранено ✅')
         return
-    count = count_photos(oid, stage)
-    need = BEFORE_MIN if stage == 'BEFORE' else AFTER_MIN
-    if count < need:
-        await message.answer(f'Фото {stage}: {count}/{need}')
-        return
-    if stage == 'BEFORE' and order['status'] == 'BEFORE_REQUIRED':
-        set_status(oid, 'READY_TO_START', 'before_complete')
-        set_session(message.from_user.id, oid, None, None)
-        await message.answer(f'Фото ДО: {count}/{need} ✅', reply_markup=order_keyboard(get_order(oid)))
-    elif stage == 'AFTER' and order['status'] == 'AFTER_REQUIRED':
-        set_status(oid, 'READY_TO_COMPLETE', 'after_complete')
-        set_session(message.from_user.id, oid, None, None)
-        await message.answer(f'Фото ПОСЛЕ: {count}/{need} ✅', reply_markup=order_keyboard(get_order(oid)))
+    key = (message.from_user.id, oid, stage)
+    old = _media_feedback_tasks.get(key)
+    if old and not old.done():
+        old.cancel()
+    _media_feedback_tasks[key] = asyncio.create_task(
+        delayed_photo_feedback(message, message.from_user.id, oid, stage)
+    )
+
 @router.callback_query(F.data.startswith('start:'))
 async def start_cleaning(call: CallbackQuery):
     if not is_owner(call.from_user.id):
