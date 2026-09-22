@@ -16,6 +16,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from dotenv import load_dotenv
 
+from calendar_sync import ensure_schema, sync_calendar
+
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN', '').strip()
 OWNER_ENV = int(os.getenv('OWNER_TELEGRAM_ID', '0') or 0)
@@ -26,6 +28,11 @@ BEFORE_MIN = int(os.getenv('BEFORE_MIN_PHOTOS', '4'))
 AFTER_MIN = int(os.getenv('AFTER_MIN_PHOTOS', '4'))
 GEOFENCE_OK = int(os.getenv('GEOFENCE_OK_M', '150'))
 GEOFENCE_WARN = int(os.getenv('GEOFENCE_WARN_M', '300'))
+ICAL_URL = os.getenv('GOOGLE_CALENDAR_ICAL_URL', '').strip()
+CALENDAR_ID = os.getenv('GOOGLE_CALENDAR_ID', 'dim.pershko@gmail.com').strip()
+CALENDAR_SYNC_MINUTES = int(os.getenv('CALENDAR_SYNC_MINUTES', '5'))
+BUSINESS_TIMEZONE = os.getenv('BUSINESS_TIMEZONE', 'Europe/Moscow').strip()
+CALENDAR_KEYWORDS = tuple(x.strip() for x in os.getenv('CALENDAR_EVENT_KEYWORDS', 'клининг,уборка').split(',') if x.strip())
 router = Router()
 _instance_socket = None
 _media_feedback_tasks = {}
@@ -81,6 +88,7 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
           from_status TEXT, to_status TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL);
         ''')
+    ensure_schema(DB_PATH)
 
 
 def get_setting(key):
@@ -167,7 +175,8 @@ def haversine_m(lat1, lon1, lat2, lon2):
 def main_keyboard():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text='📅 Сегодня')],
-        [KeyboardButton(text='➕ Добавить объект')]
+        [KeyboardButton(text='➕ Добавить объект')],
+        [KeyboardButton(text='🔄 Обновить календарь')]
     ], resize_keyboard=True)
 
 
@@ -203,17 +212,26 @@ def fmt_time(value):
         return value
 
 def order_text(order):
-    return (
-        f"<b>Заказ {html.escape(order['public_number'])}</b>\n"
-        f"📍 {html.escape(order['address'])}\n"
-        f"Статус: <b>{STATUS_LABELS.get(order['status'], order['status'])}</b>\n"
-        f"Согласие: <b>{CONSENT_LABELS.get(order['consent'], order['consent'])}</b>\n\n"
-        f"Фото ДО: {count_photos(order['id'], 'BEFORE')}/{BEFORE_MIN}\n"
-        f"Фото ПОСЛЕ: {count_photos(order['id'], 'AFTER')}/{AFTER_MIN}\n"
-        f"Прибытие: {fmt_time(order['arrived_at'])}\n"
-        f"Начало: {fmt_time(order['started_at'])}\n"
-        f"Окончание: {fmt_time(order['finished_at'])}"
-    )
+    title = order['title'] if 'title' in order.keys() else None
+    scheduled = order['scheduled_start'] if 'scheduled_start' in order.keys() else None
+    lines = [f"<b>Заказ {html.escape(order['public_number'])}</b>"]
+    if title:
+        lines.append(f"🧹 {html.escape(title)}")
+    if scheduled:
+        lines.append(f"🕐 {fmt_time(scheduled)}")
+    lines.extend([
+        f"📍 {html.escape(order['address'])}",
+        f"Статус: <b>{STATUS_LABELS.get(order['status'], order['status'])}</b>",
+        f"Согласие: <b>{CONSENT_LABELS.get(order['consent'], order['consent'])}</b>",
+        '',
+        f"Фото ДО: {count_photos(order['id'], 'BEFORE')}/{BEFORE_MIN}",
+        f"Фото ПОСЛЕ: {count_photos(order['id'], 'AFTER')}/{AFTER_MIN}",
+        f"Прибытие: {fmt_time(order['arrived_at'])}",
+        f"Начало: {fmt_time(order['started_at'])}",
+        f"Окончание: {fmt_time(order['finished_at'])}",
+    ])
+    return '\n'.join(lines)
+
 
 
 async def show_order(message, order_id):
@@ -272,13 +290,42 @@ async def today(message: Message):
     if not is_owner(message.from_user.id):
         return
     with db() as c:
-        rows = c.execute('SELECT * FROM orders WHERE scheduled_date=? ORDER BY id',
+        rows = c.execute("SELECT * FROM orders WHERE scheduled_date=? AND status!='CANCELLED' "
+                         "ORDER BY CASE WHEN scheduled_start IS NULL THEN 1 ELSE 0 END, scheduled_start, id",
                          (today_str(),)).fetchall()
     if not rows:
         await message.answer('На сегодня заказов нет.', reply_markup=main_keyboard())
         return
     for order in rows:
         await message.answer(order_text(order), reply_markup=order_keyboard(order))
+
+
+async def perform_calendar_sync():
+    return await asyncio.to_thread(
+        sync_calendar,
+        DB_PATH,
+        ICAL_URL,
+        BUSINESS_TIMEZONE,
+        CALENDAR_KEYWORDS,
+    )
+
+
+@router.message(F.text == '🔄 Обновить календарь')
+async def sync_calendar_manual(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    if not ICAL_URL:
+        await message.answer('Google Календарь ещё не подключён.')
+        return
+    try:
+        result = await perform_calendar_sync()
+    except Exception as exc:
+        await message.answer(f'Не удалось обновить календарь: {type(exc).__name__}')
+        return
+    await message.answer(
+        f"Календарь обновлён ✅\nНовых: {result['new']} | Изменено: {result['updated']} | Отменено: {result['cancelled']}",
+        reply_markup=main_keyboard(),
+    )
 
 
 @router.callback_query(F.data.startswith('order:'))
@@ -552,6 +599,24 @@ async def text_input(message: Message):
     await message.answer('Заказ создан ✅\nОтправьте геоточку объекта или пропустите.', reply_markup=kb)
 
 
+async def calendar_sync_loop(bot: Bot):
+    first_run = True
+    while True:
+        if ICAL_URL:
+            try:
+                result = await perform_calendar_sync()
+                changes = result['new'] + result['updated'] + result['cancelled']
+                if changes and not first_run and owner_id():
+                    await bot.send_message(
+                        owner_id(),
+                        f"📅 Календарь обновлён: новых {result['new']}, изменений {result['updated']}, отменено {result['cancelled']}",
+                    )
+            except Exception:
+                pass
+        first_run = False
+        await asyncio.sleep(max(1, CALENDAR_SYNC_MINUTES) * 60)
+
+
 async def main():
     if not acquire_instance_lock():
         raise RuntimeError('BOT_ALREADY_RUNNING')
@@ -562,7 +627,11 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
-    await dp.start_polling(bot)
+    sync_task = asyncio.create_task(calendar_sync_loop(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        sync_task.cancel()
 
 
 if __name__ == '__main__':
